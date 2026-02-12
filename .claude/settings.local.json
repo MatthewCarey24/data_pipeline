@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(C:Usersmac22miniconda3envsquiverpython.exe -c \"import h5py; print\\(h5py.version.version\\)\")",
+      "Bash(python -c:*)"
+    ]
+  }
+}
