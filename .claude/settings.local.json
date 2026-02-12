@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python convert.py:*)",
+      "Bash(where:*)",
+      "Bash(conda activate:*)"
+    ]
+  }
+}
