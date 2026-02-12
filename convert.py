@@ -312,40 +312,45 @@ def convert_directory(
 
 
 # ---------------------------------------------------------------------------
-# Smoke-test
+# CLI entry point
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
+    import argparse
     from pathlib import Path
 
-    input_dir  = Path(r"C:\Users\matthew.carey\OneDrive - Q-State Biosciences\Documents\test_data")
-    output_dir = input_dir / "shards"
+    parser = argparse.ArgumentParser(
+        description="Convert .mat/.csv pairs in a directory to WebDataset tar shards.",
+    )
+    parser.add_argument(
+        "input_dir",
+        type=Path,
+        help="Directory containing *_traceMatrix.mat and *_sourceMetadata.csv files.",
+    )
+    parser.add_argument(
+        "-o", "--output-dir",
+        type=Path,
+        default=None,
+        help="Output directory for shards (default: <input_dir>/shards).",
+    )
+    parser.add_argument(
+        "--shard-size",
+        type=int,
+        default=1000,
+        help="Max samples per shard (default: 1000).",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="RNG seed for reproducible shuffling (default: 42).",
+    )
+    args = parser.parse_args()
 
-    # -- run directory-level conversion ----------------------------------------
-    result = convert_directory(input_dir, output_dir, shard_size=1000)
+    output_dir = args.output_dir if args.output_dir is not None else args.input_dir / "shards"
 
-    # -- spot-check a sample from the middle shard of the first plate ----------
-    plate_dirs = sorted(p for p in output_dir.iterdir() if p.is_dir())
-    if plate_dirs:
-        first_plate = plate_dirs[0]
-        shard_files = sorted(first_plate.glob("*.tar"))
-        mid_shard = shard_files[len(shard_files) // 2]
-        print(f"\nSpot-checking middle shard: {mid_shard.relative_to(output_dir)}")
-
-        sample_iter = read_tar_shard(mid_shard)
-        for _ in range(5):
-            sample = next(sample_iter)
-
-        print(f"  trace shape:    {sample['trace'].shape}  dtype={sample['trace'].dtype}")
-        print(f"  stimulus shape: {sample['stimulus'].shape}  dtype={sample['stimulus'].dtype}")
-        print(f"  metadata keys:  {len(sample['metadata'])}")
-        print(f"  cellId:         {sample['metadata']['cellId']}")
-        print(f"  CellType:       {sample['metadata']['CellType']}")
-        print(f"  Snr:            {sample['metadata']['Snr']}")
-
-        assert sample["trace"].shape == (11481,), f"Bad trace shape: {sample['trace'].shape}"
-        assert sample["stimulus"].shape == (11481,), f"Bad stimulus shape: {sample['stimulus'].shape}"
-        assert sample["trace"].dtype == np.float32
-        assert sample["stimulus"].dtype == np.float32
-        n_meta = len(sample["metadata"])
-        assert n_meta == 61, f"Expected 61 metadata keys, got {n_meta}"
-        print("\n  All assertions passed.")
+    convert_directory(
+        args.input_dir,
+        output_dir,
+        shard_size=args.shard_size,
+        seed=args.seed,
+    )
