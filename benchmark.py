@@ -354,9 +354,18 @@ def run_profile(
     print("=" * 80)
     print("  TOP 25 CUDA KERNELS (by total GPU time)")
     print("=" * 80)
+    events = prof.key_averages()
+
+    # PyTorch >=2.1 renamed cuda_time_total -> device_time_total
+    _has_device = hasattr(events[0], "device_time_total") if events else False
+    def _gpu_time(e):
+        return e.device_time_total if _has_device else e.cuda_time_total
+
+    sort_key = "device_time_total" if _has_device else "cuda_time_total"
+
     print(
-        prof.key_averages().table(
-            sort_by="cuda_time_total",
+        events.table(
+            sort_by=sort_key,
             row_limit=25,
         )
     )
@@ -366,8 +375,7 @@ def run_profile(
     print("  GPU UTILIZATION SUMMARY")
     print("=" * 80)
 
-    events = prof.key_averages()
-    total_cuda_us = sum(e.cuda_time_total for e in events)
+    total_cuda_us = sum(_gpu_time(e) for e in events)
     total_cpu_us = sum(e.cpu_time_total for e in events)
 
     # wall-clock for the profiled region (active steps only)
