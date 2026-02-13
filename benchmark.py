@@ -29,7 +29,7 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader, IterableDataset
 
 
-SEQ_LEN = 100  # first 100 timesteps of each trace
+FULL_TRACE_LEN = 11481  # full trace length from normTraceMatrix
 
 
 # ---------------------------------------------------------------------------
@@ -39,16 +39,16 @@ SEQ_LEN = 100  # first 100 timesteps of each trace
 class TransformerModel(nn.Module):
     """Simple encoder-only transformer sized to ~200M parameters.
 
-    Input:  (batch, 100)  float32
-    Output: (batch, 100)  float32  (dummy regression head)
+    Input:  (batch, seq_len)  float32
+    Output: (batch, seq_len)  float32  (dummy regression head)
     """
 
     def __init__(
         self,
-        seq_len: int = SEQ_LEN,
+        seq_len: int = FULL_TRACE_LEN,
         d_model: int = 1024,
         nhead: int = 16,
-        num_layers: int = 12,
+        num_layers: int = 16,
         dim_feedforward: int = 4096,
     ):
         super().__init__()
@@ -64,12 +64,12 @@ class TransformerModel(nn.Module):
         self.head = nn.Linear(d_model, 1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, 100)
-        x = x.unsqueeze(-1)              # (B, 100, 1)
-        x = self.input_proj(x)           # (B, 100, d_model)
+        # x: (B, SEQ_LEN)
+        x = x.unsqueeze(-1)              # (B, SEQ_LEN, 1)
+        x = self.input_proj(x)           # (B, SEQ_LEN, d_model)
         x = x + self.pos_emb
-        x = self.encoder(x)              # (B, 100, d_model)
-        x = self.head(x).squeeze(-1)     # (B, 100)
+        x = self.encoder(x)              # (B, SEQ_LEN, d_model)
+        x = self.head(x).squeeze(-1)     # (B, SEQ_LEN)
         return x
 
 
@@ -88,12 +88,13 @@ class RawMatDataset(Dataset):
         1. Picks a random .mat file
         2. Opens it with h5py, randomly samples a neuron column
         3. Reads the matching CSV for metadata
-        4. Returns trace[:100] as a float32 tensor
+        4. Returns full trace as a float32 tensor
     """
 
-    def __init__(self, mat_dir: str, length: int = 100_000):
+    def __init__(self, mat_dir: str, seq_len: int = FULL_TRACE_LEN, length: int = 100_000):
         import h5py  # noqa: F401 — validate import at init time
         self.mat_dir = Path(mat_dir)
+        self.seq_len = seq_len
         self.length = length
 
         # discover .mat / .csv pairs (same convention as convert.py)
@@ -135,7 +136,7 @@ class RawMatDataset(Dataset):
             n_neurons = f["normTraceMatrix"].shape[1]
             neuron_idx = np.random.randint(n_neurons)
             trace = np.asarray(
-                f["normTraceMatrix"][:SEQ_LEN, neuron_idx], dtype=np.float32
+                f["normTraceMatrix"][:self.seq_len, neuron_idx], dtype=np.float32
             )
 
         # load matching CSV row (metadata not used by model, but we load it
@@ -153,13 +154,14 @@ class RawMatDataset(Dataset):
 class ShardedWebDataset(IterableDataset):
     """IterableDataset backed by WebDataset .tar shards.
 
-    Streams trace.npy and stimulus.npy, slices to first 100 timesteps.
+    Streams trace.npy and stimulus.npy, returns full trace.
     """
 
-    def __init__(self, shard_dir: str):
+    def __init__(self, shard_dir: str, seq_len: int = FULL_TRACE_LEN):
         import webdataset as wds  # noqa: F401 — validate import at init
 
         self.shard_dir = Path(shard_dir)
+        self.seq_len = seq_len
         # collect all .tar files recursively (shards may live in plate sub-dirs)
         self.shard_urls = sorted(str(p) for p in self.shard_dir.rglob("*.tar"))
         if not self.shard_urls:
@@ -169,19 +171,20 @@ class ShardedWebDataset(IterableDataset):
     def __iter__(self):
         import webdataset as wds
 
+        seq_len = self.seq_len
+
+        def _slice_and_tensorize(pair):
+            trace, stimulus = pair
+            trace = np.asarray(trace, dtype=np.float32)[:seq_len]
+            return torch.from_numpy(trace)
+
         dataset = (
             wds.WebDataset(self.shard_urls, shardshuffle=True)
             .decode()
             .to_tuple("trace.npy", "stimulus.npy")
-            .map(self._slice_and_tensorize)
+            .map(_slice_and_tensorize)
         )
         yield from dataset
-
-    @staticmethod
-    def _slice_and_tensorize(pair):
-        trace, stimulus = pair
-        trace = np.asarray(trace, dtype=np.float32)[:SEQ_LEN]
-        return torch.from_numpy(trace)
 
 
 # ---------------------------------------------------------------------------
@@ -288,6 +291,108 @@ def run_benchmark(
 
 
 # ---------------------------------------------------------------------------
+# Profiling
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def run_profile(
+    loader: DataLoader,
+    model: nn.Module,
+    device: torch.device,
+    warmup_steps: int = 3,
+    active_steps: int = 5,
+) -> None:
+    """Profile *active_steps* batches with torch.profiler and print results.
+
+    Prints two tables:
+        1. Top 25 CUDA kernels sorted by total GPU time
+        2. Overall GPU vs CPU summary with utilization estimate
+    """
+    from torch.profiler import profile, ProfilerActivity, schedule
+
+    model.eval()
+    loader_iter = iter(loader)
+
+    def get_batch():
+        nonlocal loader_iter
+        try:
+            return next(loader_iter)
+        except StopIteration:
+            loader_iter = iter(loader)
+            return next(loader_iter)
+
+    # warm-up outside profiler so JIT / CUDA context init doesn't pollute
+    print(f"Warming up ({warmup_steps} batches) ...")
+    for _ in range(warmup_steps):
+        batch = get_batch().to(device)
+        model(batch)
+    torch.cuda.synchronize()
+
+    print(f"Profiling {active_steps} batches ...\n")
+
+    prof_schedule = schedule(
+        wait=0,
+        warmup=1,
+        active=active_steps,
+        repeat=1,
+    )
+
+    with profile(
+        activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+        schedule=prof_schedule,
+        record_shapes=True,
+        with_stack=False,
+    ) as prof:
+        for _ in range(1 + active_steps):  # 1 warmup + active
+            batch = get_batch()
+            batch = batch.to(device)
+            model(batch)
+            torch.cuda.synchronize()
+            prof.step()
+
+    # -- print kernel-level summary ------------------------------------------
+    print("=" * 80)
+    print("  TOP 25 CUDA KERNELS (by total GPU time)")
+    print("=" * 80)
+    print(
+        prof.key_averages().table(
+            sort_by="cuda_time_total",
+            row_limit=25,
+        )
+    )
+
+    # -- GPU utilization estimate --------------------------------------------
+    print("\n" + "=" * 80)
+    print("  GPU UTILIZATION SUMMARY")
+    print("=" * 80)
+
+    events = prof.key_averages()
+    total_cuda_us = sum(e.cuda_time_total for e in events)
+    total_cpu_us = sum(e.cpu_time_total for e in events)
+
+    # wall-clock for the profiled region (active steps only)
+    wall_us = total_cpu_us  # conservative upper bound
+    if total_cuda_us > 0 and wall_us > 0:
+        overlap_ratio = total_cuda_us / wall_us
+        print(f"  Total CUDA kernel time : {total_cuda_us / 1000:.1f} ms")
+        print(f"  Total CPU time         : {total_cpu_us / 1000:.1f} ms")
+        print(f"  CUDA / CPU ratio       : {overlap_ratio:.2f}")
+        print()
+        if overlap_ratio < 0.5:
+            print("  -> GPU is UNDERUTILIZED. Most time is spent on CPU / data loading.")
+            print("     The GPU is idle waiting for work. Consider larger batches,")
+            print("     longer sequences, or overlapping data loading with compute.")
+        elif overlap_ratio < 0.9:
+            print("  -> GPU utilization is MODERATE. Some CPU overhead between kernels.")
+        else:
+            print("  -> GPU is WELL UTILIZED. Kernel execution dominates wall time.")
+    else:
+        print("  No CUDA activity recorded.")
+
+    print("=" * 80)
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -316,6 +421,14 @@ def main():
         p.add_argument("--batch_size", type=int, default=32)
         p.add_argument("--num_workers", type=int, default=4)
         p.add_argument("--n_steps", type=int, default=50)
+        p.add_argument(
+            "--seq_len", type=int, default=FULL_TRACE_LEN,
+            help=f"Number of timesteps to use per trace (default: {FULL_TRACE_LEN} = full trace).",
+        )
+        p.add_argument(
+            "--profile", action="store_true",
+            help="Run torch.profiler on 5 batches and print a GPU kernel summary.",
+        )
 
     args = parser.parse_args()
 
@@ -326,13 +439,15 @@ def main():
     print(f"Device: {torch.cuda.get_device_name(device)}\n")
 
     # -- model -----------------------------------------------------------------
-    model = TransformerModel().to(device)
+    seq_len = args.seq_len
+    model = TransformerModel(seq_len=seq_len).to(device)
     n_params = count_parameters(model)
-    print(f"Model parameters: {n_params:,}  ({n_params / 1e6:.1f}M)\n")
+    print(f"Model parameters: {n_params:,}  ({n_params / 1e6:.1f}M)")
+    print(f"Sequence length:  {seq_len}\n")
 
     # -- dataloader ------------------------------------------------------------
     if args.mode == "raw":
-        dataset = RawMatDataset(str(args.mat_dir))
+        dataset = RawMatDataset(str(args.mat_dir), seq_len=seq_len)
         loader = DataLoader(
             dataset,
             batch_size=args.batch_size,
@@ -342,7 +457,7 @@ def main():
             drop_last=True,
         )
     else:  # sharded
-        dataset = ShardedWebDataset(str(args.shard_dir))
+        dataset = ShardedWebDataset(str(args.shard_dir), seq_len=seq_len)
         loader = DataLoader(
             dataset,
             batch_size=args.batch_size,
@@ -355,7 +470,10 @@ def main():
           f"|  num_workers={args.num_workers}  |  n_steps={args.n_steps}\n")
 
     # -- run -------------------------------------------------------------------
-    run_benchmark(loader, model, device, n_steps=args.n_steps)
+    if args.profile:
+        run_profile(loader, model, device)
+    else:
+        run_benchmark(loader, model, device, n_steps=args.n_steps)
 
 
 if __name__ == "__main__":
