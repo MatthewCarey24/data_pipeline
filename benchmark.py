@@ -20,6 +20,8 @@ Common flags:
 import argparse
 import io
 import math
+import subprocess
+import threading
 import time
 from pathlib import Path
 
@@ -33,11 +35,11 @@ FULL_TRACE_LEN = 11481  # full trace length from normTraceMatrix
 
 
 # ---------------------------------------------------------------------------
-# Transformer model (~200M parameters)
+# Transformer model (~15M parameters)
 # ---------------------------------------------------------------------------
 
 class TransformerModel(nn.Module):
-    """Simple encoder-only transformer sized to ~200M parameters.
+    """Simple encoder-only transformer sized to ~15M parameters.
 
     Input:  (batch, seq_len)  float32
     Output: (batch, seq_len)  float32  (dummy regression head)
@@ -46,10 +48,10 @@ class TransformerModel(nn.Module):
     def __init__(
         self,
         seq_len: int = FULL_TRACE_LEN,
-        d_model: int = 1024,
-        nhead: int = 16,
-        num_layers: int = 16,
-        dim_feedforward: int = 4096,
+        d_model: int = 512,
+        nhead: int = 8,
+        num_layers: int = 6,
+        dim_feedforward: int = 2048,
     ):
         super().__init__()
         self.input_proj = nn.Linear(1, d_model)
@@ -188,6 +190,59 @@ class ShardedWebDataset(IterableDataset):
 
 
 # ---------------------------------------------------------------------------
+# GPU utilization monitor (polls nvidia-smi in a background thread)
+# ---------------------------------------------------------------------------
+
+class GpuUtilMonitor:
+    """Sample GPU utilization % in a background thread via nvidia-smi."""
+
+    def __init__(self, device_index: int = 0, interval: float = 0.25):
+        self.device_index = device_index
+        self.interval = interval
+        self.samples: list[int] = []
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self):
+        self._stop.clear()
+        self.samples.clear()
+        self._thread = threading.Thread(target=self._poll, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> list[int]:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=5)
+        return self.samples
+
+    def _poll(self):
+        while not self._stop.is_set():
+            try:
+                out = subprocess.check_output(
+                    ["nvidia-smi",
+                     f"--id={self.device_index}",
+                     "--query-gpu=utilization.gpu",
+                     "--format=csv,noheader,nounits"],
+                    text=True, timeout=2,
+                )
+                val = int(out.strip())
+                self.samples.append(val)
+            except Exception:
+                pass
+            self._stop.wait(self.interval)
+
+    def summary(self) -> str:
+        if not self.samples:
+            return "  GPU util: no samples collected"
+        arr = np.array(self.samples)
+        return (
+            f"  GPU util:  avg={arr.mean():.0f}%  "
+            f"min={arr.min()}%  max={arr.max()}%  "
+            f"({len(arr)} samples)"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Timing helpers
 # ---------------------------------------------------------------------------
 
@@ -242,6 +297,8 @@ def run_benchmark(
         model(batch)
     torch.cuda.synchronize()
 
+    gpu_mon = GpuUtilMonitor()
+    gpu_mon.start()
     print(f"Benchmarking {n_steps} batches ...\n")
 
     for step in range(n_steps):
@@ -272,7 +329,9 @@ def run_benchmark(
         t5 = time.perf_counter()
         times_forward.append(t5 - t4)
 
-    # -- aggregate stats -----------------------------------------------------
+    # -- stop GPU monitor & aggregate stats ------------------------------------
+    gpu_mon.stop()
+
     avg_data = np.mean(times_data)
     avg_transfer = np.mean(times_transfer)
     avg_forward = np.mean(times_forward)
@@ -287,6 +346,8 @@ def run_benchmark(
     print("-" * 62)
     print(f"  {'Total':<22} {_fmt_ms(avg_total):>12}")
     print(f"\n  Bottleneck: {classify_bottleneck(avg_data, avg_transfer, avg_forward)}")
+    print()
+    print(gpu_mon.summary())
     print("=" * 62)
 
 
