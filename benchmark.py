@@ -179,7 +179,7 @@ class ShardedWebDataset(IterableDataset):
             return torch.from_numpy(trace)
 
         dataset = (
-            wds.WebDataset(self.shard_urls, shardshuffle=True)
+            wds.WebDataset(self.shard_urls, shardshuffle=len(self.shard_urls))
             .decode()
             .to_tuple("trace.npy", "stimulus.npy")
             .map(_slice_and_tensorize)
